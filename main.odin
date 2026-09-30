@@ -5,11 +5,13 @@
 //   click                     select a card
 //   click-drag                move a card (reorders within a zone, moves between zones)
 //   F1                        toggle the developer hud
+//   wheel over a slider       change its value (a notch is 1/20 of the slider's range)
 //   delete                    delete the selected card (when no textbox is focused)
 //
 // layout
-//   board : grid of slots, upper area
-//   hand  : fanned row along the bottom
+//   board : fixed grid of cells (columns x rows, both tunable) — drop a card on any cell;
+//           landing on an occupied cell swaps the two cards
+//   hand  : fanned row along the bottom — drops insert, and the rest shuffle along
 //   cards are fatty structs: content, layout slot, motion state and interaction state all in one
 //
 // fonts
@@ -58,6 +60,7 @@ CARD_H      :: 196.0
 PIVOT_ABOVE :: 0.55 * CARD_H               // dangle pivot height above the card's top edge
 CENTER_BELOW :: PIVOT_ABOVE + CARD_H * 0.5 // card center is this far below the pivot
 DRAG_SLOP   :: 6.0                         // px of mouse travel before a press becomes a drag
+SLIDER_WHEEL_FRACTION :: 0.05              // one wheel notch = this share of a slider's range, but never less than one step
 TILT_VSCALE :: 0.001                       // tilt_gain is expressed per 1000 px/s
 MAX_CARDS   :: 64
 TITLE_MAX   :: 40
@@ -94,6 +97,7 @@ Card :: struct {
 
 	// layout / motion (anchor is the dangle pivot, not the card center)
 	zone:        Zone,
+	cell:        int, // board cell index; meaningful when zone == .BOARD
 	home:        rl.Vector2,
 	rest_angle:  f32,
 	anchor:      rl.Vector2,
@@ -123,6 +127,7 @@ Tuning :: struct {
 	drag_lift:    f32,
 	drag_scale:   f32,
 	board_cols:   f32,
+	board_rows:   f32,
 	board_gap:    f32,
 	hand_spacing: f32,
 	hand_tilt:    f32,
@@ -140,6 +145,7 @@ DEFAULT_TUNING :: Tuning{
 	drag_lift    = 10,
 	drag_scale   = 1.12,
 	board_cols   = 5,
+	board_rows   = 2,
 	board_gap    = 16,
 	hand_spacing = 118,
 	hand_tilt    = 0.045,
@@ -164,9 +170,23 @@ Game :: struct {
 	mod_shift: bool,
 	mod_ctrl:  bool,
 	mod_alt:   bool,
+
+	// slider under the cursor (set while the hud is built, consumed by the next input pass)
+	hot: Slider_Hover,
+}
+
+Slider_Hover :: struct {
+	value:  ^f32,
+	lo:     f32,
+	hi:     f32,
+	step:   f32,
+	active: bool,
 }
 
 Slot_Ref :: struct { zone: Zone, index: int }
+
+// board sort key: which card, ordered by title
+Cell_Sort :: struct { card: int, title: string }
 
 Key_Bind :: struct { ray: rl.KeyboardKey, mu: mu.Key }
 
@@ -266,51 +286,70 @@ hand_slot_center :: proc(g: ^Game, i, n: int, sw, sh: f32) -> rl.Vector2 {
 	return {sw * 0.5 + off * spacing, sh - 132 - 5 * off * off}
 }
 
-board_slot_center :: proc(g: ^Game, i: int, sw: f32) -> rl.Vector2 {
-	cols := max(1, int(g.tuning.board_cols + 0.5))
+board_grid_cols :: proc(g: ^Game) -> int { return max(1, int(g.tuning.board_cols + 0.5)) }
+board_grid_rows :: proc(g: ^Game) -> int { return max(1, int(g.tuning.board_rows + 0.5)) }
+board_cells :: proc(g: ^Game) -> int { return board_grid_cols(g) * board_grid_rows(g) }
+
+// board cell index -> center of that cell on screen
+board_cell_center :: proc(g: ^Game, cell: int, sw: f32) -> rl.Vector2 {
+	cols := board_grid_cols(g)
 	gw := f32(cols) * CARD_W + f32(cols - 1) * g.tuning.board_gap
 	x0 := sw * 0.5 - gw * 0.5 + CARD_W * 0.5
 	y0: f32 = 96 + CARD_H * 0.5
-	col := i % cols
-	row := i / cols
+	col := cell % cols
+	row := cell / cols
 	return {x0 + f32(col) * (CARD_W + g.tuning.board_gap), y0 + f32(row) * (CARD_H + g.tuning.board_gap)}
+}
+
+// index of the card sitting in `cell`, or -1
+cell_occupant :: proc(g: ^Game, cell: int) -> int {
+	for i in 0 ..< len(g.cards) {
+		if g.cards[i].zone == .BOARD && g.cards[i].cell == cell { return i }
+	}
+	return -1
+}
+
+first_free_cell :: proc(g: ^Game) -> int {
+	for cell in 0 ..< board_cells(g) {
+		if cell_occupant(g, cell) < 0 { return cell }
+	}
+	return -1
 }
 
 slot_center_for :: proc(g: ^Game, zone: Zone, i: int, sw, sh: f32) -> rl.Vector2 {
 	_, nh := zone_counts(g)
 	switch zone {
-	case .BOARD: return board_slot_center(g, i, sw)
+	case .BOARD: return board_cell_center(g, i, sw)
 	case .HAND:  return hand_slot_center(g, i, nh, sw, sh)
 	}
 	return {}
 }
 
-// nearest slot across both zones, including each zone's append slot
+// nearest target across both zones: a board cell, or an insertion point in the hand
 nearest_slot :: proc(g: ^Game, p: rl.Vector2, sw, sh: f32) -> Slot_Ref {
-	nb, nh := zone_counts(g)
+	_, nh := zone_counts(g)
 	best := Slot_Ref{.HAND, nh}
 	best_d := f32(1e9)
 	for i in 0 ..= nh {
 		d := rl.Vector2Distance(p, hand_slot_center(g, i, nh, sw, sh))
 		if d < best_d { best_d = d; best = {.HAND, i} }
 	}
-	for i in 0 ..= nb {
-		d := rl.Vector2Distance(p, board_slot_center(g, i, sw))
-		if d < best_d { best_d = d; best = {.BOARD, i} }
+	for cell in 0 ..< board_cells(g) {
+		d := rl.Vector2Distance(p, board_cell_center(g, cell, sw))
+		if d < best_d { best_d = d; best = {.BOARD, cell} }
 	}
 	return best
 }
 
 layout_cards :: proc(g: ^Game, sw, sh: f32) {
 	_, nh := zone_counts(g)
-	bi, hi := 0, 0
+	hi := 0
 	for i in 0 ..< len(g.cards) {
 		c := &g.cards[i]
 		switch c.zone {
 		case .BOARD:
-			c.home = center_to_anchor(board_slot_center(g, bi, sw))
+			c.home = center_to_anchor(board_cell_center(g, c.cell, sw))
 			c.rest_angle = 0
-			bi += 1
 		case .HAND:
 			off := f32(hi) - f32(max(nh - 1, 0)) * 0.5
 			c.home = center_to_anchor(hand_slot_center(g, hi, nh, sw, sh))
@@ -351,12 +390,17 @@ add_card :: proc(g: ^Game, zone: Zone) {
 	set_text(c.title[:], &c.title_len, fmt.tprintf("Card %d", c.uid))
 	set_text(c.cover[:], &c.cover_len, COVER_DEFAULT)
 
-	// spawn at the zone's append slot so the card eases in
+	// spawn at its slot so the card eases in
 	sw := f32(rl.GetScreenWidth())
 	sh := f32(rl.GetScreenHeight())
 	nb, nh := zone_counts(g)
-	index := zone == .HAND ? nh : nb
-	c.anchor = center_to_anchor(slot_center_for(g, zone, index, sw, sh))
+	if zone == .BOARD {
+		c.cell = first_free_cell(g)
+		if c.cell < 0 { c.cell = nb } // grid full: overflow onto the next row
+		c.anchor = center_to_anchor(board_cell_center(g, c.cell, sw))
+	} else {
+		c.anchor = center_to_anchor(hand_slot_center(g, nh, nh, sw, sh))
+	}
 	c.prev_anchor = c.anchor
 	c.home = c.anchor
 	c.angle = (f32(c.uid % 3) - 1) * 0.06
@@ -373,6 +417,13 @@ duplicate_card :: proc(g: ^Game, uid: int) {
 	c.uid = g.next_uid
 	g.next_uid += 1
 	c.image = make_art(f32(c.uid % 8) * 45 + 12) // fresh art so the copy is recognisable
+	if c.zone == .BOARD {
+		if cell := first_free_cell(g); cell >= 0 {
+			c.cell = cell
+		} else {
+			c.zone = .HAND // no free cell: the copy goes to the hand instead
+		}
+	}
 	c.hover_t = 0
 	c.drag_t = 0
 	c.sel_t = 0
@@ -392,6 +443,34 @@ delete_card :: proc(g: ^Game, uid: int) {
 	rl.UnloadTexture(g.cards[i].image)
 	ordered_remove(&g.cards, i)
 	if g.selected == uid { g.selected = -1 }
+}
+
+// drop a card onto a board cell; a card already sitting there swaps places with it
+place_on_cell :: proc(g: ^Game, uid: int, cell: int) {
+	src := index_of_uid(g, uid)
+	if src < 0 || cell < 0 { return }
+	if g.cards[src].zone == .BOARD && g.cards[src].cell == cell { return }
+
+	prev_zone := g.cards[src].zone
+	prev_cell := g.cards[src].cell
+	prev_hand := -1
+	if prev_zone == .HAND {
+		_, prev_hand = zone_position(g, uid)
+	}
+
+	if occ := cell_occupant(g, cell); occ >= 0 && occ != src {
+		other := g.cards[occ].uid
+		if prev_zone == .BOARD {
+			g.cards[occ].cell = prev_cell // board to board: swap the two cells
+		} else {
+			move_card(g, other, .HAND, prev_hand) // displaced card takes the hand slot we came from
+		}
+	}
+
+	if i := index_of_uid(g, uid); i >= 0 {
+		g.cards[i].zone = .BOARD
+		g.cards[i].cell = cell
+	}
 }
 
 // move a card so it ends up at `zone_index` of the target zone, where
@@ -432,6 +511,20 @@ shuffle_zone :: proc(g: ^Game, zone: Zone) {
 	for i in 0 ..< len(g.cards) {
 		if g.cards[i].zone == zone { append(&idxs, i) }
 	}
+
+	if zone == .BOARD {
+		// shuffle which cell each board card sits in (gaps stay gaps)
+		cells: [dynamic]int
+		defer delete(cells)
+		for idx in idxs { append(&cells, g.cards[idx].cell) }
+		for i := len(cells) - 1; i > 0; i -= 1 {
+			j := int(rng_next() % u32(i + 1))
+			cells[i], cells[j] = cells[j], cells[i]
+		}
+		for idx, k in idxs { g.cards[idx].cell = cells[k] }
+		return
+	}
+
 	for i := len(idxs) - 1; i > 0; i -= 1 {
 		j := int(rng_next() % u32(i + 1))
 		g.cards[idxs[i]], g.cards[idxs[j]] = g.cards[idxs[j]], g.cards[idxs[i]]
@@ -449,6 +542,20 @@ sort_zone :: proc(g: ^Game, zone: Zone) {
 			append(&cards, g.cards[i])
 		}
 	}
+	if zone == .BOARD {
+		// board order lives in the cells, so sort the cards and repack them into cells 0..n-1
+		keys: [dynamic]Cell_Sort
+		defer delete(keys)
+		for idx in idxs {
+			append(&keys, Cell_Sort{card = idx, title = string(g.cards[idx].title[:g.cards[idx].title_len])})
+		}
+		slice.sort_by(keys[:], proc(a, b: Cell_Sort) -> bool {
+			return strings.compare(a.title, b.title) < 0
+		})
+		for key, k in keys { g.cards[key.card].cell = k }
+		return
+	}
+
 	slice.sort_by(cards[:], proc(a, b: Card) -> bool {
 		at := a.title
 		bt := b.title
@@ -554,13 +661,10 @@ draw_card :: proc(g: ^Game, c: ^Card) {
 	rl.EndMode2D()
 }
 
-draw_board_ghosts :: proc(g: ^Game, sw, sh: f32) {
-	nb, _ := zone_counts(g)
-	cols := max(1, int(g.tuning.board_cols + 0.5))
-	rows := max(2, (nb + cols - 1) / cols)
-	cells := max(rows * cols, cols * 2)
-	for i in nb ..< cells {
-		center := board_slot_center(g, i, sw)
+draw_board_ghosts :: proc(g: ^Game, sw, _: f32) {
+	for cell in 0 ..< board_cells(g) {
+		if cell_occupant(g, cell) >= 0 { continue }
+		center := board_cell_center(g, cell, sw)
 		rec := rl.Rectangle{center.x - CARD_W * 0.5, center.y - CARD_H * 0.5, CARD_W, CARD_H}
 		rl.DrawRectangleRounded(rec, 0.08, 8, GHOST_FILL)
 		rl.DrawRectangleRoundedLinesEx(rec, 0.08, 8, 2, GHOST_LINE)
@@ -685,7 +789,26 @@ set_modifier :: proc(ui: ^mu.Context, key: mu.Key, down: bool, state: ^bool) {
 slider_row :: proc(ui: ^mu.Context, label: string, value: ^f32, lo, hi, step: f32, fmt_string: string) {
 	mu.layout_row(ui, {92, -1}, 24)
 	mu.label(ui, label)
+	id := mu.get_id(ui, uintptr(value))
 	_ = mu.slider(ui, value, lo, hi, step, fmt_string)
+	// remember it, so the wheel can nudge it on the next frame's input pass
+	if ui.hover_id == id {
+		game.hot = Slider_Hover{value = value, lo = lo, hi = hi, step = step, active = true}
+	}
+}
+
+// one wheel notch moves a slider by this share of its range, never less than a whole step
+slider_wheel_step :: proc(lo, hi, step: f32) -> f32 {
+	return max((hi - lo) * SLIDER_WHEEL_FRACTION, step)
+}
+
+// nudge a slider by `notches` wheel clicks: range-scaled, snapped to the step grid, clamped
+wheel_adjust :: proc(value, lo, hi, step: f32, notches: f32) -> f32 {
+	v := value + notches * slider_wheel_step(lo, hi, step)
+	if step > 0 {
+		v = math.floor((v + step * 0.5) / step) * step
+	}
+	return clamp(v, lo, hi)
 }
 
 // ----------------------------------------------------------------------------
@@ -706,7 +829,15 @@ frame :: proc(g: ^Game) {
 	mu.input_mouse_move(ui, i32(m.x), i32(m.y))
 	if rl.IsMouseButtonPressed(.LEFT) { mu.input_mouse_down(ui, i32(m.x), i32(m.y), .LEFT) }
 	if rl.IsMouseButtonReleased(.LEFT) { mu.input_mouse_up(ui, i32(m.x), i32(m.y), .LEFT) }
-	if wheel := rl.GetMouseWheelMove(); wheel != 0 { mu.input_scroll(ui, 0, i32(-wheel * 30)) }
+	if wheel := rl.GetMouseWheelMove(); wheel != 0 {
+		// the wheel belongs to the slider under the cursor; anywhere else it scrolls the panel
+		if g.hot.active {
+			g.hot.value^ = wheel_adjust(g.hot.value^, g.hot.lo, g.hot.hi, g.hot.step, f32(wheel))
+		} else {
+			mu.input_scroll(ui, 0, i32(-wheel * 30))
+		}
+	}
+	g.hot.active = false // slider_row sets it again while the hud is built
 	for ch := rl.GetCharPressed(); ch != 0; ch = rl.GetCharPressed() {
 		mu.input_text(ui, fmt.tprintf("%c", ch))
 	}
@@ -745,7 +876,11 @@ frame :: proc(g: ^Game) {
 				zone_now := g.cards[sel].zone
 				mu.layout_row(ui, {84, 84, 84, -1}, 28)
 				if .SUBMIT in mu.button(ui, zone_now == .HAND ? "-> board" : "-> hand") {
-					move_card(g, uid, zone_now == .HAND ? .BOARD : .HAND, 1 << 30)
+					if zone_now == .HAND {
+						if cell := first_free_cell(g); cell >= 0 { place_on_cell(g, uid, cell) }
+					} else {
+						move_card(g, uid, .HAND, 1 << 30)
+					}
 				}
 				if .SUBMIT in mu.button(ui, "duplicate") { duplicate_card(g, uid) }
 				if .SUBMIT in mu.button(ui, "delete") { delete_card(g, uid) }
@@ -773,11 +908,12 @@ frame :: proc(g: ^Game) {
 
 			nb, nh := zone_counts(g)
 			mu.layout_row(ui, {-1}, 22)
-			mu.text(ui, fmt.tprintf("%d cards · hand %d · board %d · drag across zones", len(g.cards), nh, nb))
+			mu.text(ui, fmt.tprintf("%d cards · hand %d · board %d/%d", len(g.cards), nh, nb, board_cells(g)))
 			mu.layout_row(ui, {-1}, 22)
 			mu.text(ui, g.font_loaded ? "font: " + FONT_PATH : "font: default bitmap font (missing " + FONT_PATH + ")")
 
 			slider_row(ui, "columns", &g.tuning.board_cols, 2, 8, 1, "%.0f")
+			slider_row(ui, "rows", &g.tuning.board_rows, 1, 4, 1, "%.0f")
 			slider_row(ui, "grid gap", &g.tuning.board_gap, 0, 48, 1, "%.0f")
 			slider_row(ui, "hand gap", &g.tuning.hand_spacing, 60, 200, 1, "%.0f")
 			slider_row(ui, "hand tilt", &g.tuning.hand_tilt, 0, 0.12, 0.005, "%.3f")
@@ -840,7 +976,8 @@ frame :: proc(g: ^Game) {
 		}
 	}
 
-	// drag reorder: nearest slot wins, with a little hysteresis
+	// drag targeting: the hand reorders live (cards make room), board drops are only
+	// previewed and get committed on release, so sweeping across the grid cannot shuffle it
 	g.drop_valid = false
 	if di := index_of_dragged(g); di >= 0 {
 		c := &g.cards[di]
@@ -850,15 +987,23 @@ frame :: proc(g: ^Game) {
 		g.drop_index = ref.index
 		g.drop_valid = true
 
-		cur_zone, cur_idx := zone_position(g, c.uid)
-		if ref.zone != cur_zone || ref.index != cur_idx {
-			d_new := rl.Vector2Distance(center, slot_center_for(g, ref.zone, ref.index, sw, sh))
-			d_cur := rl.Vector2Distance(center, slot_center_for(g, cur_zone, cur_idx, sw, sh))
-			if d_new < d_cur - 6 { move_card(g, c.uid, ref.zone, ref.index) }
+		if ref.zone == .HAND {
+			_, nh := zone_counts(g)
+			cur_zone, cur_idx := zone_position(g, c.uid)
+			if cur_zone != .HAND {
+				move_card(g, c.uid, .HAND, ref.index) // came off the board: just join the hand
+			} else if ref.index != cur_idx {
+				d_new := rl.Vector2Distance(center, hand_slot_center(g, ref.index, nh, sw, sh))
+				d_cur := rl.Vector2Distance(center, hand_slot_center(g, cur_idx, nh, sw, sh))
+				if d_new < d_cur - 6 { move_card(g, c.uid, .HAND, ref.index) }
+			}
 		}
 	}
 
 	if rl.IsMouseButtonReleased(.LEFT) {
+		if di := index_of_dragged(g); di >= 0 && g.drop_valid && g.drop_zone == .BOARD {
+			place_on_cell(g, g.cards[di].uid, g.drop_index)
+		}
 		for i in 0 ..< len(g.cards) {
 			g.cards[i].armed = false
 			g.cards[i].dragging = false
