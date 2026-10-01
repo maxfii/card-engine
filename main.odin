@@ -78,6 +78,9 @@ CARD_EDGE  :: rl.Color{18, 20, 28, 255}
 
 COVER_DEFAULT :: "lorem ipsum dolor sit amet, consectetur adipiscing elit"
 
+// one seeded card carries a specific title instead of the generated "Card N"
+SEED_TITLE :: "i hear you mom"
+
 Zone :: enum { BOARD, HAND }
 
 // ----------------------------------------------------------------------------
@@ -410,6 +413,14 @@ add_card :: proc(g: ^Game, zone: Zone) {
 	g.selected = c.uid
 }
 
+// add_card, then override the generated title; uid, art and spawn slot are unchanged
+add_titled_card :: proc(g: ^Game, zone: Zone, title: string) {
+	if len(g.cards) >= MAX_CARDS { return }
+	add_card(g, zone)
+	c := &g.cards[len(g.cards) - 1]
+	set_text(c.title[:], &c.title_len, title)
+}
+
 duplicate_card :: proc(g: ^Game, uid: int) {
 	src := index_of_uid(g, uid)
 	if src < 0 || len(g.cards) >= MAX_CARDS { return }
@@ -566,6 +577,7 @@ sort_zone :: proc(g: ^Game, zone: Zone) {
 
 seed_deck :: proc(g: ^Game) {
 	for i in 0 ..< 8 { add_card(g, i < 5 ? .HAND : .BOARD) }
+	add_titled_card(g, .HAND, SEED_TITLE)
 	g.selected = -1
 }
 
