@@ -14,6 +14,11 @@
 //   hand  : fanned row along the bottom — drops insert, and the rest shuffle along
 //   cards are fatty structs: content, layout slot, motion state and interaction state all in one
 //
+// hud
+//   F1 toggles the developer hud: one inspector panel with card / layout / tuning tabs,
+//   plus a performance window (fps, frame time, cpu, ram, gpu). on linux the cpu/ram
+//   figures come from /proc and the gpu name from the GL_RENDERER string.
+//
 // fonts
 //   FONT_PATH points at the ttf used for all text (currently Fira Sans Regular; FONT_PX holds
 //   the sizes).
@@ -32,6 +37,7 @@ package main
 
 import "core:fmt"
 import "core:math"
+import "core:os"
 import "core:slice"
 import "core:strings"
 import rl "vendor:raylib"
@@ -82,6 +88,8 @@ COVER_DEFAULT :: "lorem ipsum dolor sit amet, consectetur adipiscing elit"
 SEED_TITLE :: "i hear you mom"
 
 Zone :: enum { BOARD, HAND }
+
+Inspector_Tab :: enum { CARD, LAYOUT, TUNING }
 
 // ----------------------------------------------------------------------------
 // types
@@ -176,6 +184,9 @@ Game :: struct {
 
 	// slider under the cursor (set while the hud is built, consumed by the next input pass)
 	hot: Slider_Hover,
+
+	insp: Inspector_Tab,
+	perf: Perf_State,
 }
 
 Slider_Hover :: struct {
@@ -184,6 +195,27 @@ Slider_Hover :: struct {
 	hi:     f32,
 	step:   f32,
 	active: bool,
+}
+
+// rolling performance stats; cpu/ram are only sampled while the hud is visible
+Perf_State :: struct {
+	fps:          int,
+	frame_ms:     f32,
+	cpu_sys:      f32,
+	cpu_proc:     f32,
+	cpu_cores:    int,
+	ram_total_gb: f32,
+	ram_avail_gb: f32,
+	ram_proc_mb:  f32,
+	gpu:          string,
+
+	have_proc: bool,
+	primed:    bool,
+	sample_t:  f32,
+
+	prev_total: u64,
+	prev_idle:  u64,
+	prev_proc:  u64,
 }
 
 Slot_Ref :: struct { zone: Zone, index: int }
@@ -824,6 +856,311 @@ wheel_adjust :: proc(value, lo, hi, step: f32, notches: f32) -> f32 {
 }
 
 // ----------------------------------------------------------------------------
+// performance sampling: linux /proc counters + the GL_RENDERER string
+// ----------------------------------------------------------------------------
+
+when ODIN_OS == .Linux {
+	// raylib bundles glfw, which dlopens libGL at startup; resolve glGetString from
+	// that same library so the hud can name the gpu
+	foreign import dl "system:dl"
+
+	@(default_calling_convention = "c")
+	foreign dl {
+		@(link_name = "dlopen") dlopen :: proc(filename: cstring, flags: i32) -> rawptr ---
+		@(link_name = "dlsym")  dlsym  :: proc(handle: rawptr, symbol: cstring) -> rawptr ---
+	}
+
+	read_proc :: proc(path: string) -> (data: string, ok: bool) {
+		buf, err := os.read_entire_file(path, context.temp_allocator)
+		if err != nil { return "", false }
+		return string(buf), true
+	}
+
+	// first unsigned number on the first line starting with `key`
+	proc_uint_field :: proc(data, key: string) -> (value: u64, ok: bool) {
+		rest := data
+		for len(rest) > 0 {
+			nl := strings.index_byte(rest, '\n')
+			line := nl < 0 ? rest : rest[:nl]
+			if strings.has_prefix(line, key) {
+				field := line[len(key):]
+				if c := strings.index_byte(field, ':'); c >= 0 { field = field[c + 1:] }
+				field = strings.trim_left(field, " \t")
+				for b in field {
+					if b < '0' || b > '9' { break }
+					value = value * 10 + u64(b - '0')
+					ok = true
+				}
+				return
+			}
+			if nl < 0 { break }
+			rest = rest[nl + 1:]
+		}
+		return 0, false
+	}
+
+	// all numbers on the first line starting with `key`, in order
+	proc_uint_line :: proc(data, key: string) -> (vals: [16]u64, n: int) {
+		rest := data
+		for len(rest) > 0 {
+			nl := strings.index_byte(rest, '\n')
+			line := nl < 0 ? rest : rest[:nl]
+			if strings.has_prefix(line, key) {
+				field := line[len(key):]
+				pos := 0
+				for pos < len(field) && n < len(vals) {
+					for pos < len(field) && (field[pos] == ' ' || field[pos] == '\t') { pos += 1 }
+					start := pos
+					num: u64
+					for pos < len(field) && field[pos] >= '0' && field[pos] <= '9' {
+						num = num * 10 + u64(field[pos] - '0')
+						pos += 1
+					}
+					if pos > start { vals[n] = num; n += 1 }
+				}
+				return
+			}
+			if nl < 0 { break }
+			rest = rest[nl + 1:]
+		}
+		return
+	}
+
+	count_lines_with_prefix :: proc(data, key: string) -> (count: int) {
+		rest := data
+		for len(rest) > 0 {
+			nl := strings.index_byte(rest, '\n')
+			line := nl < 0 ? rest : rest[:nl]
+			if strings.has_prefix(line, key) { count += 1 }
+			if nl < 0 { break }
+			rest = rest[nl + 1:]
+		}
+		return
+	}
+
+	// /proc/self/stat: utime + stime (fields 14 and 15). the comm field may contain
+	// spaces, so everything past the last ')' is field 3 onwards: token 0 is state,
+	// token 11 is utime and token 12 is stime
+	self_cpu_jiffies :: proc(data: string) -> (jif: u64) {
+		i := strings.last_index_byte(data, ')')
+		if i < 0 { return 0 }
+		rest := strings.trim_left(data[i + 1:], " ")
+		tok := 0
+		pos := 0
+		for pos < len(rest) && tok <= 12 {
+			for pos < len(rest) && (rest[pos] == ' ' || rest[pos] == '\t') { pos += 1 }
+			if pos >= len(rest) { break }
+			start := pos
+			num: u64
+			for pos < len(rest) && rest[pos] >= '0' && rest[pos] <= '9' {
+				num = num * 10 + u64(rest[pos] - '0')
+				pos += 1
+			}
+			if pos == start { // non-numeric token (the state char) — skip it
+				for pos < len(rest) && rest[pos] != ' ' && rest[pos] != '\t' { pos += 1 }
+				tok += 1
+				continue
+			}
+			if tok == 11 || tok == 12 { jif += num }
+			tok += 1
+		}
+		return
+	}
+
+	// GL_RENDERER of the running gpu, or "unknown"
+	gl_renderer_string :: proc() -> string {
+		handle := dlopen("libGL.so.1", 1) // RTLD_LAZY
+		if handle == nil { return "unknown" }
+		fn := dlsym(handle, "glGetString")
+		if fn == nil { return "unknown" }
+		get_string := cast(proc(u32) -> cstring)fn
+		s := get_string(0x1F01) // GL_RENDERER
+		if s == nil { return "unknown" }
+		return string(s)
+	}
+
+	// sample every half second: system + process cpu from jiffy deltas, and
+	// system + process ram from meminfo and status
+	sampler_perf :: proc(g: ^Game) {
+		if g.time - g.perf.sample_t < 0.5 { return }
+		g.perf.sample_t = g.time
+
+		if g.perf.cpu_cores == 0 {
+			if cpuinfo, ok := read_proc("/proc/cpuinfo"); ok {
+				g.perf.cpu_cores = count_lines_with_prefix(cpuinfo, "processor")
+			}
+		}
+
+		now_total, now_idle, now_proc: u64
+		if stat, ok := read_proc("/proc/stat"); ok {
+			vals, n := proc_uint_line(stat, "cpu ")
+			if n >= 5 {
+				for i in 0 ..< n { now_total += vals[i] }
+				now_idle = vals[3] + vals[4] // idle + iowait
+			}
+		}
+		if st, ok := read_proc("/proc/self/stat"); ok {
+			now_proc = self_cpu_jiffies(st)
+		}
+		if g.perf.primed && now_total > g.perf.prev_total {
+			dt_total := now_total - g.perf.prev_total
+			if dt_total > 0 {
+				dt_idle := now_idle - g.perf.prev_idle
+				g.perf.cpu_sys = clamp(100 * (1 - f32(dt_idle) / f32(dt_total)), 0, 100)
+				g.perf.cpu_proc = clamp(100 * f32(now_proc - g.perf.prev_proc) / f32(dt_total), 0, 100)
+			}
+		}
+		g.perf.prev_total = now_total
+		g.perf.prev_idle = now_idle
+		g.perf.prev_proc = now_proc
+
+		if mem, ok := read_proc("/proc/meminfo"); ok {
+			if total_kb, ok := proc_uint_field(mem, "MemTotal:"); ok {
+				g.perf.ram_total_gb = f32(total_kb) / (1024 * 1024)
+			}
+			if avail_kb, ok := proc_uint_field(mem, "MemAvailable:"); ok {
+				g.perf.ram_avail_gb = f32(avail_kb) / (1024 * 1024)
+			} else if free_kb, ok := proc_uint_field(mem, "MemFree:"); ok {
+				g.perf.ram_avail_gb = f32(free_kb) / (1024 * 1024)
+			}
+		}
+		if status, ok := read_proc("/proc/self/status"); ok {
+			if rss_kb, ok := proc_uint_field(status, "VmRSS:"); ok {
+				g.perf.ram_proc_mb = f32(rss_kb) / 1024
+			}
+		}
+
+		g.perf.have_proc = true
+		g.perf.fps = int(rl.GetFPS())
+		g.perf.frame_ms = rl.GetFrameTime() * 1000
+		g.perf.primed = true
+	}
+}
+
+tab_name :: proc(t: Inspector_Tab) -> string {
+	switch t {
+	case .CARD:   return "card"
+	case .LAYOUT: return "layout"
+	case .TUNING: return "tuning"
+	}
+	return ""
+}
+
+// inspector > card: the selected card's content and zone actions
+inspector_tab_card :: proc(g: ^Game, ui: ^mu.Context) {
+	sel := index_of_uid(g, g.selected)
+	if sel < 0 {
+		mu.text(ui, "no card selected\nclick a card to inspect it\nF1 hides the hud")
+	} else {
+		uid := g.cards[sel].uid
+
+		mu.layout_row(ui, {52, -1}, 26)
+		mu.label(ui, "title")
+		r1 := mu.layout_next(ui)
+		_ = mu.textbox_raw(ui, g.cards[sel].title[:], &g.cards[sel].title_len, mu.get_id(ui, fmt.tprintf("title##%d", uid)), r1, {})
+		g.cards[sel].title_len = clamp(g.cards[sel].title_len, 0, TITLE_MAX)
+
+		mu.layout_row(ui, {52, -1}, 26)
+		mu.label(ui, "cover")
+		r2 := mu.layout_next(ui)
+		_ = mu.textbox_raw(ui, g.cards[sel].cover[:], &g.cards[sel].cover_len, mu.get_id(ui, fmt.tprintf("cover##%d", uid)), r2, {})
+		g.cards[sel].cover_len = clamp(g.cards[sel].cover_len, 0, COVER_MAX)
+
+		zone_now := g.cards[sel].zone
+		mu.layout_row(ui, {84, 84, 84, -1}, 28)
+		if .SUBMIT in mu.button(ui, zone_now == .HAND ? "-> board" : "-> hand") {
+			if zone_now == .HAND {
+				if cell := first_free_cell(g); cell >= 0 { place_on_cell(g, uid, cell) }
+			} else {
+				move_card(g, uid, .HAND, 1 << 30)
+			}
+		}
+		if .SUBMIT in mu.button(ui, "duplicate") { duplicate_card(g, uid) }
+		if .SUBMIT in mu.button(ui, "delete") { delete_card(g, uid) }
+
+		// re-look-up: the buttons above may have moved or removed the card
+		if fi := index_of_uid(g, uid); fi >= 0 {
+			mu.layout_row(ui, {-1}, 22)
+			mu.text(ui, fmt.tprintf(
+				"uid %d · %s · title %d/%d · cover %d/%d",
+				uid, zone_name(g.cards[fi].zone),
+				g.cards[fi].title_len, TITLE_MAX,
+				g.cards[fi].cover_len, COVER_MAX,
+			))
+		}
+	}
+}
+
+// inspector > layout: deck actions and the board / hand layout
+inspector_tab_layout :: proc(g: ^Game, ui: ^mu.Context) {
+	mu.layout_row(ui, {84, 84, 84, -1}, 28)
+	if .SUBMIT in mu.button(ui, "add card") { add_card(g, .HAND) }
+	if .SUBMIT in mu.button(ui, "shuffle") { shuffle_zone(g, .HAND); shuffle_zone(g, .BOARD) }
+	if .SUBMIT in mu.button(ui, "sort") { sort_zone(g, .HAND); sort_zone(g, .BOARD) }
+	if .SUBMIT in mu.button(ui, "reset") { reset_all(g) }
+
+	nb, nh := zone_counts(g)
+	mu.layout_row(ui, {-1}, 22)
+	mu.text(ui, fmt.tprintf("%d cards · hand %d · board %d/%d", len(g.cards), nh, nb, board_cells(g)))
+	mu.layout_row(ui, {-1}, 22)
+	mu.text(ui, g.font_loaded ? "font: " + FONT_PATH : "font: default bitmap font (missing " + FONT_PATH + ")")
+
+	slider_row(ui, "columns", &g.tuning.board_cols, 2, 8, 1, "%.0f")
+	slider_row(ui, "rows", &g.tuning.board_rows, 1, 4, 1, "%.0f")
+	slider_row(ui, "grid gap", &g.tuning.board_gap, 0, 48, 1, "%.0f")
+	slider_row(ui, "hand gap", &g.tuning.hand_spacing, 60, 200, 1, "%.0f")
+	slider_row(ui, "hand tilt", &g.tuning.hand_tilt, 0, 0.12, 0.005, "%.3f")
+
+	mu.layout_row(ui, {-1}, 22)
+	mu.text(ui, "ctrl+c/v/x/a work inside textboxes")
+}
+
+// inspector > tuning: motion and feel sliders
+inspector_tab_tuning :: proc(g: ^Game, ui: ^mu.Context) {
+	slider_row(ui, "follow", &g.tuning.follow_speed, 4, 60, 0.5, "%.1f")
+	slider_row(ui, "settle", &g.tuning.return_speed, 2, 30, 0.5, "%.1f")
+	slider_row(ui, "dangle k", &g.tuning.dangle_k, 10, 400, 1, "%.0f")
+	slider_row(ui, "damp", &g.tuning.dangle_damp, 0.5, 16, 0.1, "%.1f")
+	slider_row(ui, "tilt", &g.tuning.tilt_gain, 0, 0.8, 0.01, "%.2f")
+	slider_row(ui, "max tilt", &g.tuning.max_tilt, 0.05, 0.9, 0.01, "%.2f")
+	slider_row(ui, "hover lift", &g.tuning.hover_lift, 0, 40, 1, "%.0f")
+	slider_row(ui, "hover scale", &g.tuning.hover_scale, 1, 1.3, 0.01, "%.2f")
+	slider_row(ui, "drag lift", &g.tuning.drag_lift, 0, 60, 1, "%.0f")
+	slider_row(ui, "drag scale", &g.tuning.drag_scale, 1, 1.4, 0.01, "%.2f")
+
+	mu.layout_row(ui, {-1}, 28)
+	if .SUBMIT in mu.button(ui, "reset tuning") { g.tuning = DEFAULT_TUNING }
+}
+
+// performance window: fps, frame time, cpu, ram, gpu
+perf_ui :: proc(g: ^Game, ui: ^mu.Context) {
+	x := max(i32(f32(rl.GetScreenWidth())) - 296, 16)
+	if mu.window(ui, "Performance", {x, 16, 280, 164}, {.NO_RESIZE}) {
+		mu.layout_row(ui, {-1}, 22)
+		mu.text(ui, fmt.tprintf("fps  %d   ·   %.2f ms", g.perf.fps, g.perf.frame_ms))
+
+		mu.layout_row(ui, {-1}, 22)
+		if g.perf.have_proc {
+			mu.text(ui, fmt.tprintf("cpu  %.0f%% sys · %.1f%% app · %d cores", g.perf.cpu_sys, g.perf.cpu_proc, g.perf.cpu_cores))
+		} else {
+			mu.text(ui, "cpu  n/a (needs linux /proc)")
+		}
+
+		mu.layout_row(ui, {-1}, 22)
+		if g.perf.have_proc {
+			mu.text(ui, fmt.tprintf("ram  %.1f / %.1f GiB · app %.0f MiB", g.perf.ram_avail_gb, g.perf.ram_total_gb, g.perf.ram_proc_mb))
+		} else {
+			mu.text(ui, "ram  n/a (needs linux /proc)")
+		}
+
+		mu.layout_row(ui, {-1}, 22)
+		gpu := fmt.tprintf("gpu  %s", g.perf.gpu)
+		if len(gpu) > 33 { gpu = fmt.tprintf("%s...", gpu[:30]) }
+		mu.text(ui, gpu)
+	}
+}
+
+// ----------------------------------------------------------------------------
 // the frame: single update + draw megafunction
 // ----------------------------------------------------------------------------
 
@@ -863,93 +1200,29 @@ frame :: proc(g: ^Game) {
 	if rl.IsKeyPressed(.F1) { g.show_ui = !g.show_ui }
 
 	// ------------------------------------------------------------ dev hud
+	when ODIN_OS == .Linux {
+		if g.show_ui { sampler_perf(g) }
+	}
 	mu.begin(ui)
 	if g.show_ui {
-		// inspector ------------------------------------------------
-		if mu.window(ui, "Inspector", {16, 16, 352, 210}, {.NO_RESIZE}) {
-			sel := index_of_uid(g, g.selected)
-			if sel < 0 {
-				mu.text(ui, "no card selected\nclick a card to inspect it\nF1 hides the hud")
-			} else {
-				uid := g.cards[sel].uid
+		// one tabbed inspector: card / layout / tuning ---------------
+		if mu.window(ui, "Inspector", {16, 16, 352, 410}, {.NO_RESIZE}) {
+			mu.layout_row(ui, {-1, -1, -1}, 26)
+			for tab in Inspector_Tab {
+				name := tab_name(tab)
+				shown := g.insp == tab ? fmt.tprintf("* %s", name) : name
+				if .SUBMIT in mu.button(ui, shown) { g.insp = tab }
+			}
 
-				mu.layout_row(ui, {52, -1}, 26)
-				mu.label(ui, "title")
-				r1 := mu.layout_next(ui)
-				_ = mu.textbox_raw(ui, g.cards[sel].title[:], &g.cards[sel].title_len, mu.get_id(ui, fmt.tprintf("title##%d", uid)), r1, {})
-				g.cards[sel].title_len = clamp(g.cards[sel].title_len, 0, TITLE_MAX)
-
-				mu.layout_row(ui, {52, -1}, 26)
-				mu.label(ui, "cover")
-				r2 := mu.layout_next(ui)
-				_ = mu.textbox_raw(ui, g.cards[sel].cover[:], &g.cards[sel].cover_len, mu.get_id(ui, fmt.tprintf("cover##%d", uid)), r2, {})
-				g.cards[sel].cover_len = clamp(g.cards[sel].cover_len, 0, COVER_MAX)
-
-				zone_now := g.cards[sel].zone
-				mu.layout_row(ui, {84, 84, 84, -1}, 28)
-				if .SUBMIT in mu.button(ui, zone_now == .HAND ? "-> board" : "-> hand") {
-					if zone_now == .HAND {
-						if cell := first_free_cell(g); cell >= 0 { place_on_cell(g, uid, cell) }
-					} else {
-						move_card(g, uid, .HAND, 1 << 30)
-					}
-				}
-				if .SUBMIT in mu.button(ui, "duplicate") { duplicate_card(g, uid) }
-				if .SUBMIT in mu.button(ui, "delete") { delete_card(g, uid) }
-
-				// re-look-up: the buttons above may have moved or removed the card
-				if fi := index_of_uid(g, uid); fi >= 0 {
-					mu.layout_row(ui, {-1}, 22)
-					mu.text(ui, fmt.tprintf(
-						"uid %d · %s · title %d/%d · cover %d/%d",
-						uid, zone_name(g.cards[fi].zone),
-						g.cards[fi].title_len, TITLE_MAX,
-						g.cards[fi].cover_len, COVER_MAX,
-					))
-				}
+			switch g.insp {
+			case .CARD:   inspector_tab_card(g, ui)
+			case .LAYOUT: inspector_tab_layout(g, ui)
+			case .TUNING: inspector_tab_tuning(g, ui)
 			}
 		}
 
-		// layout ----------------------------------------------------
-		if mu.window(ui, "Layout", {16, 240, 352, 270}, {.NO_RESIZE}) {
-			mu.layout_row(ui, {84, 84, 84, -1}, 28)
-			if .SUBMIT in mu.button(ui, "add card") { add_card(g, .HAND) }
-			if .SUBMIT in mu.button(ui, "shuffle") { shuffle_zone(g, .HAND); shuffle_zone(g, .BOARD) }
-			if .SUBMIT in mu.button(ui, "sort") { sort_zone(g, .HAND); sort_zone(g, .BOARD) }
-			if .SUBMIT in mu.button(ui, "reset") { reset_all(g) }
-
-			nb, nh := zone_counts(g)
-			mu.layout_row(ui, {-1}, 22)
-			mu.text(ui, fmt.tprintf("%d cards · hand %d · board %d/%d", len(g.cards), nh, nb, board_cells(g)))
-			mu.layout_row(ui, {-1}, 22)
-			mu.text(ui, g.font_loaded ? "font: " + FONT_PATH : "font: default bitmap font (missing " + FONT_PATH + ")")
-
-			slider_row(ui, "columns", &g.tuning.board_cols, 2, 8, 1, "%.0f")
-			slider_row(ui, "rows", &g.tuning.board_rows, 1, 4, 1, "%.0f")
-			slider_row(ui, "grid gap", &g.tuning.board_gap, 0, 48, 1, "%.0f")
-			slider_row(ui, "hand gap", &g.tuning.hand_spacing, 60, 200, 1, "%.0f")
-			slider_row(ui, "hand tilt", &g.tuning.hand_tilt, 0, 0.12, 0.005, "%.3f")
-
-			mu.layout_row(ui, {-1}, 22)
-			mu.text(ui, "ctrl+c/v/x/a work inside textboxes")
-		}
-
-		// tuning ----------------------------------------------------
-		if mu.window(ui, "Tuning", {i32(sw) - 324, 16, 308, 430}, {.NO_RESIZE}) {
-			slider_row(ui, "follow", &g.tuning.follow_speed, 4, 60, 0.5, "%.1f")
-			slider_row(ui, "settle", &g.tuning.return_speed, 2, 30, 0.5, "%.1f")
-			slider_row(ui, "dangle k", &g.tuning.dangle_k, 10, 400, 1, "%.0f")
-			slider_row(ui, "damp", &g.tuning.dangle_damp, 0.5, 16, 0.1, "%.1f")
-			slider_row(ui, "tilt", &g.tuning.tilt_gain, 0, 0.8, 0.01, "%.2f")
-			slider_row(ui, "max tilt", &g.tuning.max_tilt, 0.05, 0.9, 0.01, "%.2f")
-			slider_row(ui, "hover lift", &g.tuning.hover_lift, 0, 40, 1, "%.0f")
-			slider_row(ui, "hover scale", &g.tuning.hover_scale, 1, 1.3, 0.01, "%.2f")
-			slider_row(ui, "drag lift", &g.tuning.drag_lift, 0, 60, 1, "%.0f")
-			slider_row(ui, "drag scale", &g.tuning.drag_scale, 1, 1.4, 0.01, "%.2f")
-
-			mu.layout_row(ui, {-1}, 28)
-			if .SUBMIT in mu.button(ui, "reset tuning") { g.tuning = DEFAULT_TUNING }
-		}
+		// performance ------------------------------------------------
+		perf_ui(g, ui)
 	}
 	mu.end(ui)
 
@@ -1094,6 +1367,9 @@ main :: proc() {
 	rl.InitWindow(1280, 760, "cards dev — odin + raylib + microui")
 	defer rl.CloseWindow()
 	rl.SetTargetFPS(60)
+	when ODIN_OS == .Linux {
+		game.perf.gpu = gl_renderer_string()
+	}
 
 	load_fonts(&game)
 	defer unload_fonts(&game)
